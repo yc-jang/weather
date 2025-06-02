@@ -84,3 +84,84 @@ class LagFeatureGenerator:
 
         result_df.index = original_index
         return result_df
+
+
+import re
+import pandas as pd
+
+class LagFeatureGenerator:
+    def __init__(self, lot_col='LOT_ID', target_col='discharge', n_lags=3,
+                 stat_types=['mean', 'std', 'min', 'max'], fillna_value=-999):
+        self.lot_col = lot_col
+        self.target_col = target_col
+        self.n_lags = n_lags
+        self.stat_types = stat_types
+        self.fillna_value = fillna_value
+        self.lag_feature_names_ = []
+        self.sorted_lot_groups_ = []
+        self._lot_col_created = False
+        self._reset_indexed = False
+
+    def _extract_group_from_lot(self, lot):
+        match = re.search(r'[ILM](\d{6})\d{2}$', lot)
+        return match.group(0) if match else lot
+
+    def _prepare_lot_col(self, df):
+        df = df.copy()
+        if self.lot_col not in df.columns:
+            df[self.lot_col] = df.index
+            self._lot_col_created = True
+        if df.index.name == self.lot_col:
+            df = df.reset_index()
+            self._reset_indexed = True
+        return df
+
+    def _finalize_output(self, df):
+        if self._lot_col_created:
+            df.drop(columns=[self.lot_col], inplace=True)
+        if self._reset_indexed:
+            df.set_index(self.lot_col, inplace=True)
+        self._lot_col_created = False
+        self._reset_indexed = False
+        return df
+
+    def fit(self, df):
+        df = self._prepare_lot_col(df)
+        df['LOT_group'] = df[self.lot_col].apply(self._extract_group_from_lot)
+        group_values = df.groupby('LOT_group')[self.target_col].mean().sort_index()
+        self.sorted_lot_groups_ = group_values.index.tolist()
+        return self
+
+    def transform(self, df):
+        df = self._prepare_lot_col(df)
+        df['LOT_group'] = df[self.lot_col].apply(self._extract_group_from_lot)
+
+        group_values = df.groupby('LOT_group')[self.target_col].mean()
+        group_df = pd.DataFrame({self.target_col: group_values})
+        group_df = group_df.reindex(self.sorted_lot_groups_)
+
+        for stat in self.stat_types:
+            for i in range(1, self.n_lags + 1):
+                col_name = f'{self.target_col}_lag_{stat}_{i}'
+                self.lag_feature_names_.append(col_name)
+
+                if stat == 'mean':
+                    lag_vals = [self.fillna_value]*i + group_df[self.target_col].tolist()[:-i]
+                else:
+                    window = group_df[self.target_col].shift(i).rolling(window=i)
+                    if stat == 'std':
+                        lag_vals = window.std().tolist()
+                    elif stat == 'min':
+                        lag_vals = window.min().tolist()
+                    elif stat == 'max':
+                        lag_vals = window.max().tolist()
+                    else:
+                        raise ValueError(f"Unsupported stat type: {stat}")
+                    lag_vals[:i] = [self.fillna_value]*i
+
+                group_df[col_name] = lag_vals
+
+        df = df.merge(group_df[self.lag_feature_names_], left_on='LOT_group', right_index=True, how='left')
+        df.drop(columns=['LOT_group'], inplace=True)
+        df = self._finalize_output(df)
+        return df
