@@ -165,3 +165,90 @@ class LagFeatureGenerator:
         df.drop(columns=['LOT_group'], inplace=True)
         df = self._finalize_output(df)
         return df
+
+
+import pandas as pd
+import numpy as np
+import re
+
+class LagFeatureGenerator:
+    def __init__(self, lot_col='LOT_ID', target_col='discharge',
+                 n_lags=3, mark_missing_value=-999):
+        self.lot_col = lot_col
+        self.target_col = target_col
+        self.n_lags = n_lags
+        self.mark_missing_value = mark_missing_value
+        self.group_stats_ = None
+
+    def _parse_lot_info(self, lot_id):
+        # LOT ID에서 Line, Date, Serial 추출
+        match = re.match(r'.*([ILM])(\d{6})(\d{2})$', lot_id)
+        if match:
+            return match.groups()
+        return (None, None, None)
+
+    def _ensure_lot_info(self, df):
+        # LOT 관련 파싱된 정보 생성
+        df['LOT_line'], df['LOT_date'], df['LOT_serial'] = zip(*df[self.lot_col].map(self._parse_lot_info))
+        df['LOT_group'] = df['LOT_line'] + df['LOT_date']
+        return df
+
+    def fit(self, df):
+        df = df.copy()
+        if self.lot_col not in df.columns:
+            df[self.lot_col] = df.index  # index가 LOT인 경우
+
+        df = self._ensure_lot_info(df)
+
+        # LOT_group 기준 집계: target에 대한 mean, std, min, max
+        self.group_stats_ = (
+            df.groupby('LOT_group')[self.target_col]
+              .agg(['mean', 'std', 'min', 'max'])
+              .reset_index()
+              .rename(columns={
+                  'mean': f'{self.target_col}_mean',
+                  'std': f'{self.target_col}_std',
+                  'min': f'{self.target_col}_min',
+                  'max': f'{self.target_col}_max'
+              })
+        )
+
+        # 시간 순서를 위한 정렬
+        self.group_stats_['sort_key'] = self.group_stats_['LOT_group']
+        self.group_stats_ = self.group_stats_.sort_values('sort_key').reset_index(drop=True)
+
+        return self
+
+    def transform(self, df):
+        df = df.copy()
+        if self.lot_col not in df.columns:
+            df[self.lot_col] = df.index
+
+        original_index = df.index.copy()
+
+        df = self._ensure_lot_info(df)
+
+        # lag 통계용 데이터프레임 구성
+        lag_base = self.group_stats_.copy()
+        lag_features = ['mean', 'std', 'min', 'max']
+        full_lag_df = pd.DataFrame({'LOT_group': lag_base['LOT_group']})
+
+        for i in range(1, self.n_lags + 1):
+            for stat in lag_features:
+                col_name = f'{self.target_col}_lag_{i}_{stat}'
+                shifted = [self.mark_missing_value] * i + lag_base[f'{self.target_col}_{stat}'].tolist()[:-i]
+                full_lag_df[col_name] = shifted
+
+        # 병합
+        df = df.merge(full_lag_df, on='LOT_group', how='left')
+
+        # 불필요한 계산용 컬럼 제거
+        df.drop(columns=['LOT_line', 'LOT_date', 'LOT_serial', 'LOT_group'], inplace=True, errors='ignore')
+
+        # 컬럼 정렬: 기존 컬럼 + lag 컬럼
+        lag_cols = [col for col in df.columns if col.startswith(f'{self.target_col}_lag_')]
+        existing_cols = [col for col in df.columns if col not in lag_cols]
+        df = df[existing_cols + lag_cols]
+
+        df.index = original_index
+        return df
